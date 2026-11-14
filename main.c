@@ -72,7 +72,7 @@ static int nr_in_fill(void) {
 static int nr_lua_fgetc(FILE* f) {
     if (f && f->fd < 0) {
         if (f->ungot >= 0) { int c = f->ungot; f->ungot = -1; return c; }
-        if (nr_inpos >= nr_inlen && !nr_in_fill()) return EOF;
+        if (nr_inpos >= nr_inlen && !nr_in_fill()) { f->eof = 1; return EOF; }
         return (unsigned char)nr_inbuf[nr_inpos++];
     }
     return (fgetc)(f);
@@ -110,9 +110,11 @@ static char* nr_lua_fgets(char* buf, int n, FILE* f) {
 
 static unsigned long nr_lua_fread(void* p, unsigned long z,
                                   unsigned long n, FILE* f) {
+    if (!p || z == 0 || n == 0) return 0;
     if (f && f->fd < 0) {
         unsigned char* d = (unsigned char*)p;
         unsigned long total = z * n;
+        if (total / n != z) return 0;
         unsigned long got = 0;
         while (got < total) {
             int c = nr_lua_fgetc(f);
@@ -139,14 +141,17 @@ double strtod(const char* s, char** end) {
     if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
 
     // inf / infinity
-    if ((p[0]|32) == 'i' && (p[1]|32) == 'n' && (p[2]|32) == 'f') {
+    if (p[0] && p[1] && p[2] &&
+        (p[0]|32) == 'i' && (p[1]|32) == 'n' && (p[2]|32) == 'f') {
         p += 3;
-        if ((p[0]|32) == 'i' && (p[1]|32) == 'n' && (p[2]|32) == 'y') p += 3;
+        if (p[0] && p[1] && p[2] && p[3] &&
+            (p[0]|32) == 'i' && (p[1]|32) == 'n' && (p[2]|32) == 'y') p += 3;
         if (end) *end = (char*)p;
         return neg ? -INFINITY : INFINITY;
     }
     // nan
-    if ((p[0]|32) == 'n' && (p[1]|32) == 'a' && (p[2]|32) == 'n') {
+    if (p[0] && p[1] && p[2] &&
+        (p[0]|32) == 'n' && (p[1]|32) == 'a' && (p[2]|32) == 'n') {
         if (end) *end = (char*)(p + 3);
         return __builtin_nan("");
     }
@@ -169,7 +174,7 @@ double strtod(const char* s, char** end) {
             else if ((c|32) >= 'a' && (c|32) <= 'f') v = (c|32) - 'a' + 10;
             else break;
             any = 1;
-            if (ndig < 19) { mant = (mant << 4) | (unsigned)v; ndig++; }
+            if (ndig < 16) { mant = (mant << 4) | (unsigned)v; ndig++; }
             if (seen_dot) exp2 -= 4;
             p++;
         } else {
@@ -180,7 +185,7 @@ double strtod(const char* s, char** end) {
             }
             any = 1;
             v = c - '0';
-            if (ndig < 19) { mant = mant * 10 + (unsigned)v; ndig++; }
+            if (ndig < 19 && mant < 1844674407370955161ULL) { mant = mant * 10 + (unsigned)v; ndig++; }
             else if (!seen_dot) exp10++;      // 丢掉的多余高位数字按数量级补偿
             if (seen_dot) exp10--;
             p++;
@@ -192,7 +197,9 @@ double strtod(const char* s, char** end) {
     }
 
     if (hex) {
-        if ((p[0]|32) == 'p') {               // 2 的幂指数
+        const char* q = p + 1;
+        if (q[0] == '+' || q[0] == '-') q++;
+        if ((p[0]|32) == 'p' && q[0] >= '0' && q[0] <= '9') {   // 2 的幂指数
             int sg = 0, e = 0;
             p++;
             if (p[0] == '+' || p[0] == '-') { sg = (p[0] == '-'); p++; }
@@ -207,7 +214,9 @@ double strtod(const char* s, char** end) {
         return neg ? -v : v;
     }
 
-    if ((p[0]|32) == 'e') {                   // 10 的幂指数
+    const char* qe = p + 1;
+    if (qe[0] == '+' || qe[0] == '-') qe++;
+    if ((p[0]|32) == 'e' && qe[0] >= '0' && qe[0] <= '9') {   // 10 的幂指数
         int sg = 0;
         long long e = 0;
         p++;
@@ -258,8 +267,10 @@ static int nr_script(const char* path) {
     static __attribute__((section(".data"))) char src[65536];
     unsigned long n = fread(src, 1, sizeof(src) - 1, f);
     int ferr = ferror(f);
+    int fmore = !feof(f);
     fclose(f);
     if (n == 0 && ferr) { printf("lua: read error %s\n", path); return -1; }
+    if (fmore) { printf("lua: script exceeds %u bytes %s\n", (unsigned)(sizeof(src) - 1), path); return -1; }
     src[n] = '\0';
 
     char name[280];
